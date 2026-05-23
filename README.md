@@ -65,7 +65,7 @@ You will see a confirmation message:
 
 `Starting API Payload Key-Mapping Bridge on port 11434...` Keep this terminal window running in the background.
 
-![Bridge Is Running](images/Screenshot 2026-05-23 173608.png)
+![Bridge Is Running](images/Screenshot_2026-05-23_173608.png)
 
 ---
 
@@ -79,7 +79,7 @@ To route your workflow strings seamlessly through the universal bridge:
 http://127.0.0.1:11434
 
 ```
-![ComfyUI Node Configured](images/Screenshot 2026-05-23 173523.png)
+![ComfyUI Node Configured](images/Screenshot_2026-05-23_173523.png)
 
 3. Ensure your standard dynamic text prompts and system instruction boxes are wired up normally.
 4. Click **Queue Prompt**. Your workspace nodes will now parse text blocks with 100% mechanical consistency.
