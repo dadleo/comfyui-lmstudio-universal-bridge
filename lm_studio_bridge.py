@@ -6,7 +6,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ==================== CONFIGURATIONS ====================
 OLLAMA_DEFAULT_PORT = 11434
 LM_STUDIO_URL = "http://127.0.0.1:1234"
-LM_API_TOKEN = "sk-lm-JPk02vWM:9SSkR4pq4RZhZD004U9y" 
+LM_API_TOKEN = "YOUR_LM_STUDIO_API_KEY_HERE" 
 # ========================================================
 
 class LMStudioProxyHandler(BaseHTTPRequestHandler):
