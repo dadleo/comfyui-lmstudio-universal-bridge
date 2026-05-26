@@ -2,7 +2,7 @@ import json
 import re
 import urllib.request
 import socket
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ==================== CONFIGURATIONS ====================
 OLLAMA_DEFAULT_PORT = 11434
@@ -11,13 +11,13 @@ LM_STUDIO_URL = "http://127.0.0.1:1234"
 # YOUR LM STUDIO API TOKEN
 LM_API_TOKEN = "YOUR_LM_STUDIO_API_KEY_HERE" 
 
-# TIMEOUT: 2400 seconds (40 minutes) for deep reasoning
-GLOBAL_TIMEOUT = 2400 
+# TIMEOUT: 3600 seconds (1 hour) to survive deep reasoning
+GLOBAL_TIMEOUT = 3600 
 # ========================================================
 
 class UniversalBridgeHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        pass # Keep terminal clean
+        pass 
 
     def do_GET(self):
         """Universal Model Sync: Fetches loaded models with Authorization."""
@@ -39,8 +39,7 @@ class UniversalBridgeHandler(BaseHTTPRequestHandler):
                     ollama_models = [{"name": "no-model-loaded", "model": "error", "details": {"family": "llama"}}]
                 
                 response_data = {"models": ollama_models}
-            except Exception as e:
-                print(f"!!! GET ERROR: {e}")
+            except Exception:
                 response_data = {"models": [{"name": "bridge-connection-error", "model": "error", "details": {"family": "llama"}}]}
 
             self.send_response(200)
@@ -49,64 +48,65 @@ class UniversalBridgeHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(response_data).encode('utf-8'))
 
     def do_POST(self):
-        """Universal Reasoning Stripper with Strict Payload Handling."""
+        """Universal Reasoning Stripper with Persistence."""
         if self.path in ['/api/generate', '/api/chat']:
-            try:
-                content_length = int(self.headers['Content-Length'])
-                raw_body = self.rfile.read(content_length).decode('utf-8')
-                body = json.loads(raw_body)
-                
-                prompt = body.get("prompt", "") or body.get("messages", [{}])[-1].get("content", "")
-                model_name = body.get("model", "lm-studio-model")
-                system_prompt = body.get("system", "")
+            content_length = int(self.headers['Content-Length'])
+            body = json.loads(self.rfile.read(content_length).decode('utf-8'))
+            
+            prompt = body.get("prompt", "") or body.get("messages", [{}])[-1].get("content", "")
+            model_name = body.get("model", "lm-studio-model")
+            system_prompt = body.get("system", "")
 
+            # Prevent Error Loops: Don't send previous error messages as prompts
+            if "Bridge POST Error" in prompt or "HTTP Error" in prompt:
+                final_output = "Error: Input contained a previous failure message. Check workflow logic."
+            else:
                 messages = []
                 if system_prompt:
                     messages.append({"role": "system", "content": str(system_prompt).strip()})
                 messages.append({"role": "user", "content": prompt})
 
-                payload_dict = {
+                payload = {
                     "model": model_name,
                     "messages": messages,
                     "temperature": body.get("options", {}).get("temperature", 0.7),
                     "stream": False
                 }
-                
-                encoded_payload = json.dumps(payload_dict).encode('utf-8')
 
-                # Request to LM Studio
-                req = urllib.request.Request(f"{LM_STUDIO_URL}/v1/chat/completions", data=encoded_payload, method='POST')
-                req.add_header('Content-Type', 'application/json; charset=utf-8')
-                req.add_header('Authorization', f'Bearer {LM_API_TOKEN}')
-                req.add_header('Content-Length', str(len(encoded_payload)))
-                req.add_header('Connection', 'keep-alive')
-                
-                print(f"--- Model {model_name}: Thinking... ---")
-                
-                with urllib.request.urlopen(req, timeout=GLOBAL_TIMEOUT) as response:
-                    lm_res = json.loads(response.read().decode('utf-8'))
-                    raw_text = lm_res['choices'][0]['message']['content']
+                try:
+                    req = urllib.request.Request(
+                        f"{LM_STUDIO_URL}/v1/chat/completions",
+                        data=json.dumps(payload).encode('utf-8'),
+                        headers={
+                            'Content-Type': 'application/json',
+                            'Authorization': f'Bearer {LM_API_TOKEN}',
+                            'Connection': 'keep-alive'
+                        },
+                        method='POST'
+                    )
                     
-                    # UNIVERSAL REASONING STRIPPING
-                    cleaned = re.sub(r"<(think|thought|reasoning)>.*?</\1>", "", raw_text, flags=re.DOTALL | re.IGNORECASE)
-                    if "---" in cleaned:
-                        cleaned = cleaned.split("---")[-1]
-                    
-                    headers_regex = r"^(#+|\*\*+)\s*(Reasoning|Thought|Analysis|Verification|Process|Step-by-step).*?(\n|$)"
-                    cleaned = re.sub(headers_regex, "", cleaned, flags=re.MULTILINE | re.IGNORECASE)
-                    
-                    anchors_regex = r"^(#+|\*\*+)?\s*(Final\s*Answer|Final\s*Output|Result|Output|Lyrics|Tags|Title|Songtitle)\s*(:|#+)?\s*"
-                    cleaned = re.sub(anchors_regex, "", cleaned, flags=re.MULTILINE | re.IGNORECASE)
-                    
-                    cleaned = re.sub(r"```[a-zA-Z]*\n|```", "", cleaned)
-                    final_output = cleaned.strip()
-                    print(f"--- Success: Sending result to ComfyUI ---")
-                    
-            except Exception as e:
-                print(f"!!! BRIDGE POST ERROR: {e}")
-                final_output = f"Bridge Error: {str(e)}"
+                    print(f"--- Model {model_name} is reasoning (Wait up to 1hr)... ---")
+                    with urllib.request.urlopen(req, timeout=GLOBAL_TIMEOUT) as response:
+                        lm_res = json.loads(response.read().decode('utf-8'))
+                        raw_text = lm_res['choices'][0]['message']['content']
+                        
+                        # UNIVERSAL CLEANING
+                        cleaned = re.sub(r"<(think|thought|reasoning)>.*?</\1>", "", raw_text, flags=re.DOTALL | re.IGNORECASE)
+                        if "---" in cleaned: cleaned = cleaned.split("---")[-1]
+                        
+                        headers_regex = r"^(#+|\*\*+)\s*(Reasoning|Thought|Analysis|Verification|Process|Step-by-step).*?(\n|$)"
+                        cleaned = re.sub(headers_regex, "", cleaned, flags=re.MULTILINE | re.IGNORECASE)
+                        
+                        anchors_regex = r"^(#+|\*\*+)?\s*(Final\s*Answer|Final\s*Output|Result|Output|Lyrics|Tags|Title|Songtitle)\s*(:|#+)?\s*"
+                        cleaned = re.sub(anchors_regex, "", cleaned, flags=re.MULTILINE | re.IGNORECASE)
+                        
+                        final_output = re.sub(r"```[a-zA-Z]*\n|```", "", cleaned).strip()
+                        print(f"--- Done! ---")
+                        
+                except Exception as e:
+                    print(f"!!! BRIDGE ERROR: {e}")
+                    final_output = f"Bridge POST Error: {str(e)}"
 
-            # Create Ollama-compatible response
             ollama_response = {
                 "model": model_name,
                 "response": final_output,
@@ -123,24 +123,16 @@ class UniversalBridgeHandler(BaseHTTPRequestHandler):
                 self.send_header('Connection', 'keep-alive')
                 self.end_headers()
                 self.wfile.write(response_bytes)
-            except Exception as e:
-                print(f"!!! CLIENT DISCONNECT: ComfyUI closed the connection before bridge could finish: {e}")
+            except BrokenPipeError:
+                print("!!! ERROR: ComfyUI closed the connection before the bridge could send data.")
 
 if __name__ == '__main__':
-    # Force system-level persistent timeout
     socket.setdefaulttimeout(GLOBAL_TIMEOUT)
-    
-    server_address = ('127.0.0.1', OLLAMA_DEFAULT_PORT)
-    httpd = HTTPServer(server_address, UniversalBridgeHandler)
-    
-    # Enable Keep-Alive at socket level
-    httpd.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    
-    print(f"Universal API Bridge active on port {OLLAMA_DEFAULT_PORT}...")
-    print(f"Targeting LM Studio at {LM_STUDIO_URL}")
-    
+    # Using ThreadingHTTPServer to handle long-blocked connections correctly
+    server = ThreadingHTTPServer(('127.0.0.1', OLLAMA_DEFAULT_PORT), UniversalBridgeHandler)
+    server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    print(f"Universal API Bridge (Threading) active on port {OLLAMA_DEFAULT_PORT}...")
     try:
-        httpd.serve_forever()
+        server.serve_forever()
     except KeyboardInterrupt:
-        print("\nShutting down bridge.")
-        httpd.server_close()
+        server.server_close()
