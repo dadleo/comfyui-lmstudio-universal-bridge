@@ -1,138 +1,147 @@
 import json
-import re
 import urllib.request
+import urllib.error
 import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ==================== CONFIGURATIONS ====================
 OLLAMA_DEFAULT_PORT = 11434
 LM_STUDIO_URL = "http://127.0.0.1:1234"
-
-# YOUR LM STUDIO API TOKEN
 LM_API_TOKEN = "YOUR_LM_STUDIO_API_KEY_HERE" 
-
-# TIMEOUT: 3600 seconds (1 hour) to survive deep reasoning
 GLOBAL_TIMEOUT = 3600 
 # ========================================================
 
-class UniversalBridgeHandler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        pass 
+def fetch_lm_studio_models():
+    """Fetches all models available in LM Studio for ComfyUI's dropdown."""
+    try:
+        req = urllib.request.Request(f"{LM_STUDIO_URL}/v1/models", method='GET')
+        req.add_header('Authorization', f'Bearer {LM_API_TOKEN}')
+        with urllib.request.urlopen(req, timeout=10) as res:
+            lm_data = json.loads(res.read().decode('utf-8'))
+            models = lm_data.get("data", [])
+            if models:
+                return [{"name": m["id"], "model": m["id"]} for m in models]
+    except Exception as e:
+        print(f"[BRIDGE] Warning: Could not fetch models list from LM Studio: {e}")
+    return [{"name": "lm-studio-model", "model": "lm-studio-model"}]
+
+class UniversalStreamingProxy(BaseHTTPRequestHandler):
+    def log_message(self, format, *args): pass 
 
     def do_GET(self):
-        """Universal Model Sync: Fetches loaded models with Authorization."""
         if self.path == '/api/tags':
-            try:
-                req = urllib.request.Request(f"{LM_STUDIO_URL}/v1/models", method='GET')
-                req.add_header('Authorization', f'Bearer {LM_API_TOKEN}')
-                with urllib.request.urlopen(req, timeout=10) as res:
-                    lm_data = json.loads(res.read().decode('utf-8'))
-                
-                ollama_models = []
-                for m in lm_data.get("data", []):
-                    m_id = m.get("id")
-                    ollama_models.append({
-                        "name": m_id, "model": m_id, "details": {"family": "llama"}
-                    })
-                
-                if not ollama_models:
-                    ollama_models = [{"name": "no-model-loaded", "model": "error", "details": {"family": "llama"}}]
-                
-                response_data = {"models": ollama_models}
-            except Exception:
-                response_data = {"models": [{"name": "bridge-connection-error", "model": "error", "details": {"family": "llama"}}]}
-
+            ollama_models = fetch_lm_studio_models()
+            response_data = {"models": ollama_models}
+            
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps(response_data).encode('utf-8'))
 
     def do_POST(self):
-        """Universal Reasoning Stripper with Persistence."""
-        if self.path in ['/api/generate', '/api/chat']:
-            content_length = int(self.headers['Content-Length'])
-            body = json.loads(self.rfile.read(content_length).decode('utf-8'))
-            
-            prompt = body.get("prompt", "") or body.get("messages", [{}])[-1].get("content", "")
-            model_name = body.get("model", "lm-studio-model")
-            system_prompt = body.get("system", "")
-
-            # Prevent Error Loops: Don't send previous error messages as prompts
-            if "Bridge POST Error" in prompt or "HTTP Error" in prompt:
-                final_output = "Error: Input contained a previous failure message. Check workflow logic."
-            else:
-                messages = []
-                if system_prompt:
-                    messages.append({"role": "system", "content": str(system_prompt).strip()})
-                messages.append({"role": "user", "content": prompt})
-
-                payload = {
-                    "model": model_name,
-                    "messages": messages,
-                    "temperature": body.get("options", {}).get("temperature", 0.7),
-                    "stream": False
-                }
-
-                try:
-                    req = urllib.request.Request(
-                        f"{LM_STUDIO_URL}/v1/chat/completions",
-                        data=json.dumps(payload).encode('utf-8'),
-                        headers={
-                            'Content-Type': 'application/json',
-                            'Authorization': f'Bearer {LM_API_TOKEN}',
-                            'Connection': 'keep-alive'
-                        },
-                        method='POST'
-                    )
-                    
-                    print(f"--- Model {model_name} is reasoning (Wait up to 1hr)... ---")
-                    with urllib.request.urlopen(req, timeout=GLOBAL_TIMEOUT) as response:
-                        lm_res = json.loads(response.read().decode('utf-8'))
-                        raw_text = lm_res['choices'][0]['message']['content']
-                        
-                        # UNIVERSAL CLEANING
-                        cleaned = re.sub(r"<(think|thought|reasoning)>.*?</\1>", "", raw_text, flags=re.DOTALL | re.IGNORECASE)
-                        if "---" in cleaned: cleaned = cleaned.split("---")[-1]
-                        
-                        headers_regex = r"^(#+|\*\*+)\s*(Reasoning|Thought|Analysis|Verification|Process|Step-by-step).*?(\n|$)"
-                        cleaned = re.sub(headers_regex, "", cleaned, flags=re.MULTILINE | re.IGNORECASE)
-                        
-                        anchors_regex = r"^(#+|\*\*+)?\s*(Final\s*Answer|Final\s*Output|Result|Output|Lyrics|Tags|Title|Songtitle)\s*(:|#+)?\s*"
-                        cleaned = re.sub(anchors_regex, "", cleaned, flags=re.MULTILINE | re.IGNORECASE)
-                        
-                        final_output = re.sub(r"```[a-zA-Z]*\n|```", "", cleaned).strip()
-                        print(f"--- Done! ---")
-                        
-                except Exception as e:
-                    print(f"!!! BRIDGE ERROR: {e}")
-                    final_output = f"Bridge POST Error: {str(e)}"
-
-            ollama_response = {
-                "model": model_name,
-                "response": final_output,
-                "message": {"role": "assistant", "content": final_output},
-                "context": [1, 2, 3, 4, 5], 
-                "done": True
-            }
-
+        if self.path in ['/api/generate', '/api/chat', '/api/generate/']:
             try:
-                response_bytes = json.dumps(ollama_response).encode('utf-8')
+                content_length = int(self.headers.get('Content-Length', 0))
+                body = json.loads(self.rfile.read(content_length).decode('utf-8'))
+                
+                # 1. EXTRACT PROMPTS AND DISABLE THINKING IN SYSTEM PROMPT
+                raw_system = body.get("system", "")
+                no_think_directive = "Respond directly. Do NOT output any reasoning, analysis, or thinking steps."
+                system_prompt = f"{no_think_directive}\n\n{raw_system}" if raw_system else no_think_directive
+                
+                raw_prompt = body.get("prompt", "") or body.get("messages", [{}])[-1].get("content", "")
+                
+                requested_model = body.get("model", "")
+                if not requested_model or requested_model == "lm-studio-model":
+                    available = fetch_lm_studio_models()
+                    requested_model = available[0]["model"]
+                
+                options = body.get("options", {})
+                temp = options.get("temperature", 0.3)
+                max_tokens = options.get("num_predict", 1024)
+                if max_tokens <= 0:
+                    max_tokens = 1024
+                
+                stop_seq = options.get("stop", None)
+
+                print(f"[BRIDGE] Executing request for model: '{requested_model}' (Thinking Disabled)")
+
+                # 2. ATTEMPT 1: Standard System + User Role with Thinking Disabled in Payload
+                messages = []
+                messages.append({"role": "system", "content": system_prompt})
+                messages.append({"role": "user", "content": raw_prompt})
+                
+                payload = {
+                    "model": requested_model,
+                    "messages": messages,
+                    "temperature": temp,
+                    "max_tokens": max_tokens,
+                    "reasoning_effort": "none",               # Disables thinking mode via API
+                    "chat_template_kwargs": {"thinking": False}, # Disables llama.cpp thinking pass
+                    "stream": False 
+                }
+                if stop_seq:
+                    payload["stop"] = stop_seq
+
+                full_content = ""
+                try:
+                    req = urllib.request.Request(f"{LM_STUDIO_URL}/v1/chat/completions", data=json.dumps(payload).encode('utf-8'), method='POST')
+                    req.add_header('Content-Type', 'application/json')
+                    req.add_header('Authorization', f'Bearer {LM_API_TOKEN}')
+                    
+                    with urllib.request.urlopen(req, timeout=GLOBAL_TIMEOUT) as response:
+                        lm_response = json.loads(response.read().decode('utf-8'))
+                        msg = lm_response['choices'][0]['message']
+                        full_content = msg.get('content', '') or ''
+                except urllib.error.HTTPError as http_err:
+                    print(f"[BRIDGE] Standard role request failed ({http_err.code}), attempting merged fallback...")
+
+                # 3. ATTEMPT 2: Fallback for System-Role Sensitive Models
+                if not full_content.strip():
+                    merged_content = f"SYSTEM INSTRUCTIONS:\n{system_prompt}\n\nUSER TASK:\n{raw_prompt}"
+                    fallback_payload = {
+                        "model": requested_model,
+                        "messages": [{"role": "user", "content": merged_content}],
+                        "temperature": temp,
+                        "max_tokens": max_tokens,
+                        "reasoning_effort": "none",
+                        "chat_template_kwargs": {"thinking": False},
+                        "stream": False
+                    }
+                    if stop_seq:
+                        fallback_payload["stop"] = stop_seq
+
+                    req_fb = urllib.request.Request(f"{LM_STUDIO_URL}/v1/chat/completions", data=json.dumps(fallback_payload).encode('utf-8'), method='POST')
+                    req_fb.add_header('Content-Type', 'application/json')
+                    req_fb.add_header('Authorization', f'Bearer {LM_API_TOKEN}')
+
+                    with urllib.request.urlopen(req_fb, timeout=GLOBAL_TIMEOUT) as response_fb:
+                        lm_response_fb = json.loads(response_fb.read().decode('utf-8'))
+                        msg_fb = lm_response_fb['choices'][0]['message']
+                        full_content = msg_fb.get('content', '') or ''
+
+                print(f"[BRIDGE] Success! Returned {len(full_content.strip())} characters.")
+
+                final_obj = {
+                    "model": requested_model,
+                    "done": True,
+                    "response": full_content.strip()
+                }
+                
+                resp_bytes = json.dumps(final_obj).encode('utf-8')
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
-                self.send_header('Content-Length', str(len(response_bytes)))
-                self.send_header('Connection', 'keep-alive')
+                self.send_header('Content-Length', str(len(resp_bytes)))
                 self.end_headers()
-                self.wfile.write(response_bytes)
-            except BrokenPipeError:
-                print("!!! ERROR: ComfyUI closed the connection before the bridge could send data.")
+                self.wfile.write(resp_bytes)
+                self.wfile.flush()
+                    
+            except Exception as e:
+                print(f"!!! Error in do_POST: {e}")
+                self.send_error(500, str(e))
 
 if __name__ == '__main__':
     socket.setdefaulttimeout(GLOBAL_TIMEOUT)
-    # Using ThreadingHTTPServer to handle long-blocked connections correctly
-    server = ThreadingHTTPServer(('127.0.0.1', OLLAMA_DEFAULT_PORT), UniversalBridgeHandler)
-    server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    print(f"Universal API Bridge (Threading) active on port {OLLAMA_DEFAULT_PORT}...")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        server.server_close()
+    server = ThreadingHTTPServer(('127.0.0.1', OLLAMA_DEFAULT_PORT), UniversalStreamingProxy)
+    print(f"Universal API Bridge Ready on {OLLAMA_DEFAULT_PORT}")
+    server.serve_forever()
